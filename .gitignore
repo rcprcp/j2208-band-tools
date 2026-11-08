@@ -16,6 +16,11 @@ __pycache__/
 .venv/
 venv/
 
+# Local configuration (never commit credentials)
+.env
+.env.*
+!.env.example
+
 # Editor / OS
 .vscode/
 .idea/

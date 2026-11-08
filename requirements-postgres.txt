@@ -1,0 +1,3 @@
+# Optional PostgreSQL backend. SQLite users do not need these.
+psycopg[binary]>=3.3,<4
+psycopg-pool>=3.3,<4

@@ -1,7 +1,12 @@
 """Long-running desktop collector for a J2208-family band.
 
-Holds one persistent BLE connection and writes to SQLite. Reconnects on drop.
-Runs entirely on the PC - the phone and the companion app are not involved.
+Holds one persistent BLE connection and writes to SQLite or PostgreSQL.
+Reconnects on drop. Runs entirely on the PC - the phone and the companion app
+are not involved.
+
+Storage is selected with --backend or J2208_DB_BACKEND (sqlite|postgres).
+PostgreSQL settings come from J2208_PG_* / standard PG* environment variables;
+see tools/j2208_store.py and README.md.
 
 Two collection modes, which differ enormously in battery cost:
 
@@ -24,11 +29,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import signal
-import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from bleak import BleakClient, BleakError
@@ -49,93 +54,16 @@ from j2208 import (  # noqa: E402
     parse_sleep_packet,
     totals_stride,
 )
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS live (
-    ts TEXT NOT NULL, hr INTEGER, spo2 INTEGER, hrv INTEGER, stress INTEGER,
-    bp_sys INTEGER, bp_dia INTEGER, temp_c REAL,
-    PRIMARY KEY (ts)
-);
-CREATE TABLE IF NOT EXISTS battery (
-    ts TEXT PRIMARY KEY, pct INTEGER NOT NULL, mode TEXT
-);
-CREATE TABLE IF NOT EXISTS history (
-    type TEXT NOT NULL, device_time TEXT NOT NULL, payload TEXT NOT NULL,
-    fetched_at TEXT NOT NULL,
-    PRIMARY KEY (type, device_time)
-);
-CREATE TABLE IF NOT EXISTS events (
-    ts TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT
-);
-"""
+from j2208_store import (  # noqa: E402
+    Store,
+    backend_from_env,
+    make_store,
+    normalise_device_id,
+)
 
 # Which history types are worth polling on a loop. Excludes the ones that are
 # empty on V2 firmware (0x54 hr_dynamic, 0x60 spo2, 0x62 temp).
 POLL_TYPES = ["hr", "temp_axil", "spo2_auto", "hrv", "steps", "total", "sleep"]
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-class Store:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.executescript(SCHEMA)
-        self.db.commit()
-
-    def event(self, kind: str, detail: str = ""):
-        self.db.execute("INSERT INTO events VALUES (?,?,?)", (now_iso(), kind, detail))
-        self.db.commit()
-
-    def battery(self, pct: int, mode: str):
-        self.db.execute(
-            "INSERT OR REPLACE INTO battery VALUES (?,?,?)", (now_iso(), pct, mode)
-        )
-        self.db.commit()
-
-    def live(self, rec: dict) -> bool:
-        cur = self.db.execute(
-            "INSERT OR IGNORE INTO live VALUES (?,?,?,?,?,?,?,?)",
-            (rec["ts"], rec.get("hr"), rec.get("spo2"), rec.get("hrv"),
-             rec.get("stress"), rec.get("bp_sys"), rec.get("bp_dia"),
-             rec.get("temp_c")),
-        )
-        self.db.commit()
-        return cur.rowcount > 0
-
-    def history(self, htype: str, rows: list[dict]) -> int:
-        new = 0
-        stamp = now_iso()
-        for r in rows:
-            dt = r.get("device_time")
-            if not dt:
-                continue
-            cur = self.db.execute(
-                "INSERT OR IGNORE INTO history VALUES (?,?,?,?)",
-                (htype, dt, json.dumps(r), stamp),
-            )
-            new += cur.rowcount
-        self.db.commit()
-        return new
-
-    def drain_summary(self) -> str:
-        rows = self.db.execute(
-            "SELECT ts, pct FROM battery ORDER BY ts"
-        ).fetchall()
-        if len(rows) < 2:
-            return "battery: not enough samples yet"
-        t0 = datetime.fromisoformat(rows[0][0])
-        t1 = datetime.fromisoformat(rows[-1][0])
-        hours = (t1 - t0).total_seconds() / 3600
-        drop = rows[0][1] - rows[-1][1]
-        if hours < 0.5:
-            return f"battery: {rows[-1][1]}% (need ~1h for a drain estimate)"
-        rate = drop / hours
-        life = f"{100 / rate:.0f}h to flat" if rate > 0 else "no measurable drop yet"
-        return (f"battery: {rows[0][1]}% -> {rows[-1][1]}% over {hours:.1f}h "
-                f"({rate:+.2f} %/h, {life})")
 
 
 class BandSession:
@@ -224,7 +152,7 @@ class BandSession:
                     continue
             st = totals_stride(len(pkt)) if fields == "totals" else stride
             rows.extend(parse_records(pkt, st, fields, spec.get("date_only", False)))
-        return self.store.history(htype, rows)
+        return await self.store.history(htype, rows)
 
     async def live_burst(self, mtype: int, seconds: float) -> int:
         """Run the optical sensor for `seconds`, store every reading.
@@ -257,7 +185,7 @@ class BandSession:
                     continue
                 rec = decode(data)
                 if rec.get("hr"):  # skip the warm-up zeros
-                    stored += self.store.live(rec)
+                    stored += await self.store.live(rec)
         finally:
             if not continuous:
                 await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 0))
@@ -266,8 +194,18 @@ class BandSession:
 
 
 async def run(args) -> int:
-    store = Store(Path(args.db))
-    store.event("start", json.dumps(vars(args)))
+    device_id = normalise_device_id(args.device_id or args.address)
+    store = await make_store(
+        backend=args.backend,
+        sqlite_path=args.db,
+        device_id=device_id,
+    )
+    try:
+        await store.event("start", json.dumps(vars(args)))
+    except Exception:
+        await store.close()
+        raise
+
     stop = asyncio.Event()
 
     def _sig(*_):
@@ -284,78 +222,97 @@ async def run(args) -> int:
 
     cycle = 0
     backoff = 5
-    print(f"collector: mode={args.mode} interval={args.interval}s db={args.db}")
+    print(
+        f"collector: mode={args.mode} backend={args.backend} "
+        f"interval={args.interval}s device={device_id}"
+    )
+    print(f"storage: {getattr(store, 'backend', args.backend)}")
     print("Ctrl-C to stop\n")
 
-    while not stop.is_set():
-        try:
-            async with BleakClient(args.address, timeout=args.timeout) as client:
-                s = BandSession(client, store, stop)
-                s.interval_hint = max(5.0, args.interval - 3.0)
-                await s.setup()
-                backoff = 5
-                store.event("connected")
-                print(f"[{datetime.now():%H:%M:%S}] connected")
-
-                while not stop.is_set():
-                    cycle += 1
-                    t0 = time.monotonic()
-                    line = [f"[{datetime.now():%H:%M:%S}] #{cycle}"]
-
-                    pct = await s.read_battery()
-                    if pct is not None:
-                        store.battery(pct, args.mode)
-                        line.append(f"batt={pct}%")
-
-                    if args.mode == "live":
-                        n = await s.live_burst(args.measure_type, args.burst)
-                        line.append(f"live+{n}")
-
-                    # History sync is cheap but slow; do it every Nth cycle.
-                    if cycle == 1 or cycle % args.history_every == 0:
-                        for htype in args.types:
-                            if stop.is_set():
-                                break
-                            try:
-                                new = await s.sync_history(htype)
-                                if new:
-                                    line.append(f"{htype}+{new}")
-                            except Exception as e:
-                                line.append(f"{htype}!{type(e).__name__}")
-
-                    print("  ".join(line))
-
-                    spent = time.monotonic() - t0
-                    try:
-                        await asyncio.wait_for(
-                            stop.wait(), timeout=max(1.0, args.interval - spent)
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            if stop.is_set():
-                break
-            store.event("disconnected", f"{type(e).__name__}: {e}")
-            print(f"[{datetime.now():%H:%M:%S}] lost connection "
-                  f"({type(e).__name__}), retry in {backoff}s")
+    try:
+        while not stop.is_set():
             try:
-                await asyncio.wait_for(stop.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 120)
+                async with BleakClient(args.address, timeout=args.timeout) as client:
+                    s = BandSession(client, store, stop)
+                    s.interval_hint = max(5.0, args.interval - 3.0)
+                    await s.setup()
+                    backoff = 5
+                    await store.event("connected")
+                    print(f"[{datetime.now():%H:%M:%S}] connected")
 
-    store.event("stop")
-    print("\n" + store.drain_summary())
-    counts = store.db.execute(
-        "SELECT type, COUNT(*) FROM history GROUP BY type ORDER BY type"
-    ).fetchall()
-    live_n = store.db.execute("SELECT COUNT(*) FROM live").fetchone()[0]
-    print(f"live readings: {live_n}")
-    for t, n in counts:
-        print(f"  {t:<12} {n}")
+                    while not stop.is_set():
+                        cycle += 1
+                        t0 = time.monotonic()
+                        line = [f"[{datetime.now():%H:%M:%S}] #{cycle}"]
+
+                        pct = await s.read_battery()
+                        if pct is not None:
+                            await store.battery(pct, args.mode)
+                            line.append(f"batt={pct}%")
+
+                        if args.mode == "live":
+                            n = await s.live_burst(args.measure_type, args.burst)
+                            line.append(f"live+{n}")
+
+                        # History sync is cheap but slow; do it every Nth cycle.
+                        if cycle == 1 or cycle % args.history_every == 0:
+                            for htype in args.types:
+                                if stop.is_set():
+                                    break
+                                try:
+                                    new = await s.sync_history(htype)
+                                    if new:
+                                        line.append(f"{htype}+{new}")
+                                except Exception as e:
+                                    line.append(f"{htype}!{type(e).__name__}")
+
+                        print("  ".join(line))
+
+                        if args.once:
+                            stop.set()
+                            break
+
+                        spent = time.monotonic() - t0
+                        try:
+                            await asyncio.wait_for(
+                                stop.wait(),
+                                timeout=max(1.0, args.interval - spent),
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if stop.is_set():
+                    break
+                try:
+                    await store.event("disconnected", f"{type(e).__name__}: {e}")
+                except Exception as db_exc:
+                    print(f"could not record disconnect event: {db_exc}")
+                print(f"[{datetime.now():%H:%M:%S}] lost connection "
+                      f"({type(e).__name__}), retry in {backoff}s")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 120)
+    finally:
+        try:
+            await store.event("stop")
+        except Exception as exc:
+            print(f"could not record stop event: {exc}")
+        try:
+            print("\n" + await store.drain_summary())
+            counts = await store.stats()
+        except Exception as exc:
+            print(f"could not read storage summary: {exc}")
+            counts = {}
+        print(f"live readings: {counts.get('live', 0)}")
+        for name, count in sorted(counts.items()):
+            if name != "live":
+                print(f"  {name:<12} {count}")
+        await store.close()
     return 0
 
 
@@ -376,13 +333,24 @@ def main() -> int:
     p.add_argument("--types", nargs="+", default=POLL_TYPES, choices=POLL_TYPES,
                    help="which history types to sync. A full sweep takes ~90s; "
                         "use '--types hr' if heart rate is all you need.")
-    p.add_argument("--db", default="captures/j2208.db")
+    p.add_argument("--backend", choices=["sqlite", "postgres"],
+                   default=backend_from_env(),
+                   help="storage backend (default: J2208_DB_BACKEND or sqlite)")
+    p.add_argument("--device-id", default=os.environ.get("J2208_DEVICE_ID"),
+                   help="device identifier (default: BLE address)")
+    p.add_argument("--once", action="store_true",
+                   help="run one collection cycle and exit")
+    p.add_argument("--db", default="captures/j2208.db",
+                   help="SQLite database path (ignored for postgres)")
     p.add_argument("--timeout", type=float, default=20.0)
     args = p.parse_args()
     try:
         return asyncio.run(run(args))
     except KeyboardInterrupt:
         return 130
+    except ValueError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
