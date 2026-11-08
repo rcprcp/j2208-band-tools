@@ -154,12 +154,90 @@ the actual drain rather than guessing — printed on exit, or:
 SELECT ts, pct FROM battery ORDER BY ts;
 ```
 
+## PostgreSQL backend (optional)
+
+SQLite remains the default. The collector can write to PostgreSQL instead,
+which is useful for concurrent readers, notebooks, Grafana, and remote
+collection. The database layout is a dedicated schema (default `j2208`) in an
+existing database; it does not touch `public`.
+
+Install the optional driver:
+
+```bash
+python -m pip install -r requirements-postgres.txt
+```
+
+Create the schema and tables:
+
+```bash
+export J2208_PG_SCHEMA=j2208
+export J2208_PG_USER=bob
+export J2208_PG_DATABASE=bob
+export J2208_PG_HOST=127.0.0.1
+export J2208_PG_PASSWORD='...'
+python tools/j2208_pg_setup.py
+python tools/j2208_pg_setup.py --check
+```
+
+`J2208_PG_PASSWORD` falls back to `PGPASSWORD`. If you connect through the
+local Unix socket with peer authentication, omit the password and set
+`J2208_PG_HOST=/var/run/postgresql`. The password is read from the environment
+only; it is never a CLI argument and is never written to the `events` table.
+
+Run the collector:
+
+```bash
+J2208_DB_BACKEND=postgres python tools/j2208_daemon.py <address> \
+    --backend postgres --once --types hr
+```
+
+Then drop `--once` for continuous collection. `J2208_DB_BACKEND` and
+`--backend` are equivalent; `--db` is ignored for PostgreSQL.
+
+Environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `J2208_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
+| `J2208_PG_SCHEMA` | `j2208` | schema name (validated identifier) |
+| `J2208_PG_USER` | `$USER` / `PGUSER` | role |
+| `J2208_PG_PASSWORD` | `PGPASSWORD` | password; omit for peer auth |
+| `J2208_PG_HOST` | libpq default | host; omit for Unix socket |
+| `J2208_PG_PORT` | `5432` | port |
+| `J2208_PG_DATABASE` | `$USER` | database |
+| `J2208_PG_SSLMODE` | `prefer` | `require` for remote |
+| `J2208_PG_POOL_MIN` / `MAX` | `1` / `4` | async pool sizing |
+| `J2208_DEVICE_ID` | BLE address | device key in the database |
+
+Tables: `devices`, `history` (lossless JSONB plus `bytea` raw packets), `live`,
+`battery`, `events`, and `schema_version`. Typed views `v_hr`, `v_spo2`,
+`v_temp`, `v_hrv`, `v_steps`, `v_sleep`, and `v_total` project the common
+fields. Band timestamps are naive local time (`timestamp`); host-side times are
+UTC (`timestamptz`).
+
+Import an existing SQLite capture:
+
+```bash
+python tools/j2208_migrate_sqlite.py --sqlite captures/j2208.db
+```
+
+Back up or drop the schema independently:
+
+```bash
+pg_dump -d bob -n j2208 > j2208.sql
+python tools/j2208_pg_setup.py --drop --yes
+```
+
 ## Repo layout
 
 | Path | What |
 | --- | --- |
 | `tools/j2208.py` | BLE client — scan / probe / info / live / history / ppg / send |
-| `tools/j2208_daemon.py` | Long-running collector, SQLite output |
+| `tools/j2208_daemon.py` | Long-running collector, SQLite or PostgreSQL output |
+| `tools/j2208_store.py` | Storage backends, env parsing, identifier validation |
+| `tools/j2208_pg_setup.py` | Create / verify / drop the PostgreSQL schema |
+| `tools/j2208_migrate_sqlite.py` | Copy an existing SQLite capture into PostgreSQL |
+| `migrations/001_init.sql` | PostgreSQL schema, tables, indexes, and views |
 | `tools/probe190e.py` | Probe for the unused `0x190e` vendor service |
 | `tools/dexstrings.py` | Pure-Python DEX string + UUID miner (no Java needed) |
 | `PROTOCOL.md` | Protocol documentation |
