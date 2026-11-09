@@ -264,6 +264,29 @@ Normal output goes to `~/.local/state/j2208/collect.log`; cron only receives
 stderr if a run fails. Set `MAILTO=""` in the crontab if you do not want
 failure mail.
 
+## Live collection
+
+The PostgreSQL schema already includes the `live` table, so no migration is
+needed. `tools/j2208_collect_live.sh` runs the daemon in live mode for
+continuous HR and SpO2:
+
+```bash
+tools/j2208_collect_live.sh
+```
+
+It loads the same environment file as the cron wrapper and keeps the daemon's
+defaults (`--interval`, `--history-every`, `--types`) unchanged. Only the live
+options are selected: `--mode live`, `--measure-type 3` (SpO2, which also
+reports HR), and `--burst 0` (sensor stays on). Stop it with `Ctrl-C`; it uses
+`flock` so a second instance cannot fight over the band's single BLE
+connection.
+
+Live readings land in `live`; history syncs continue on the daemon's normal
+schedule. This mode powers the optical sensor continuously and drains the band
+much faster than history collection. The defaults can be overridden with
+`J2208_LIVE_MEASURE_TYPE`, `J2208_LIVE_BURST`, `J2208_LIVE_LOG`, and
+`J2208_LIVE_LOCK`.
+
 ## Repo layout
 
 | Path | What |
@@ -271,6 +294,7 @@ failure mail.
 | `tools/j2208.py` | BLE client — scan / probe / info / live / history / ppg / send |
 | `tools/j2208_daemon.py` | Long-running collector, SQLite or PostgreSQL output |
 | `tools/j2208_collect_once.sh` | Cron-safe one-shot collector with `flock` and logging |
+| `tools/j2208_collect_live.sh` | Continuous live HR/SpO2 collector with `flock` |
 | `tools/j2208_store.py` | Storage backends, env parsing, identifier validation |
 | `tools/j2208_pg_setup.py` | Create / verify / drop the PostgreSQL schema |
 | `tools/j2208_migrate_sqlite.py` | Copy an existing SQLite capture into PostgreSQL |
