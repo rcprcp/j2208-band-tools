@@ -17,11 +17,13 @@ Two collection modes, which differ enormously in battery cost:
 
   live     Power the optical sensor. With --burst 0, one measurement stream is
            held open for the life of the BLE connection and kept alive across
-           collection cycles. With a positive --burst, a measurement runs for
-           that many seconds each interval. The firmware ends each measurement
-           session after a short burst, so the stream is re-armed only after it
-           has actually gone quiet. Resolution is per-notification, cost is
-           roughly continuous-measurement drain.
+           collection cycles. While frames are still arriving, a fresh start is
+           sent every 20 s to roll the firmware's ~28 s measurement session over
+           before it expires, keeping HR/SpO2 continuous without a new optical
+           lock-on. If the stream goes silent, a reactionary re-arm follows.
+           With a positive --burst, a measurement runs for that many seconds
+           each interval. Resolution is per-notification, cost is roughly
+           continuous-measurement drain.
 
 Battery percentage is recorded on every cycle so actual drain can be measured
 rather than guessed - see the `battery` table.
@@ -74,11 +76,17 @@ POLL_TYPES = ["hr", "temp_axil", "spo2_auto", "hrv", "steps", "total", "sleep"]
 # old hr != 0 test discarded useful rows.
 LIVE_FIELDS = ("hr", "spo2", "hrv", "stress", "bp_sys", "bp_dia", "temp_c")
 
-# Reactionary re-arm only: the firmware ends each measurement session after a
-# short burst, so re-send the start command after this many seconds without a
-# measurement notification. Do not re-arm proactively while the sensor is
-# still streaming - that was considered and explicitly ruled out for now, even
-# though it might hide the lock-on zeros. Revisit only on a fresh request.
+# Proactive keep-alive for continuous mode. The firmware ends a type-3
+# measurement session after ~28 s; re-sending the start while frames are still
+# arriving rolls the session over without dropping the optical lock. This was
+# verified on the band: 20 s keep-alives produced continuous HR and, after the
+# initial Sp O2 lock, continuous SpO2 for 70-80 s. It is not a hard guarantee,
+# so the reactionary re-arm below remains the fallback.
+LIVE_KEEPALIVE = 20.0
+
+# Reactionary re-arm: if the stream does go quiet despite the keep-alive,
+# re-send the start command after this many seconds without a measurement
+# notification. Each reactionary re-arm pays the optical lock-on cost again.
 LIVE_REARM_IDLE = 5.0
 
 
@@ -108,6 +116,7 @@ class BandSession:
         self.live_stored = 0
         self.live_error: BaseException | None = None
         self.measuring = False
+        self.keepalives = 0
         self.rearms = 0
 
     async def setup(self):
@@ -219,15 +228,17 @@ class BandSession:
     async def start_live(self, mtype: int) -> None:
         """Start the one long-lived measurement stream for this connection.
 
-        The firmware ends each measurement session after a short burst, so the
-        worker re-arms reactionarily after LIVE_REARM_IDLE seconds of silence.
-        It is deliberately not re-armed while data is still flowing.
+        While frames keep arriving, the worker sends a proactive keep-alive
+        start before the firmware's measurement session expires. If the stream
+        does go silent, it falls back to a reactionary re-arm after
+        LIVE_REARM_IDLE seconds.
         """
         if self.live_task is not None and not self.live_task.done():
             return
         self.live_measure_type = mtype
         self.live_enabled = True
         self.live_stored = 0
+        self.keepalives = 0
         self.live_error = None
         self._drain_live_queue()
         await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
@@ -238,6 +249,7 @@ class BandSession:
 
     async def _live_loop(self, mtype: int) -> None:
         last_frame = time.monotonic()
+        last_start = last_frame
         try:
             while True:
                 try:
@@ -246,13 +258,20 @@ class BandSession:
                     )
                 except TimeoutError:
                     if time.monotonic() - last_frame >= LIVE_REARM_IDLE:
+                        now = time.monotonic()
                         await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
                         self.rearms += 1
-                        last_frame = time.monotonic()
+                        last_frame = now
+                        last_start = now
                     continue
                 if not data or data[0] != OP_MEASUREMENT_WITH_TYPE or len(data) < 10:
                     continue
-                last_frame = time.monotonic()
+                now = time.monotonic()
+                last_frame = now
+                if now - last_start >= LIVE_KEEPALIVE:
+                    await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
+                    self.keepalives += 1
+                    last_start = now
                 rec = decode(data)
                 if has_live_metrics(rec) and await self.store.live(rec):
                     self.live_stored += 1
@@ -367,6 +386,7 @@ async def run(args) -> int:
 
                         live_reported = 0
                         live_rearms_reported = 0
+                        live_keepalives_reported = 0
                         while not stop.is_set():
                             cycle += 1
                             t0 = time.monotonic()
@@ -385,9 +405,16 @@ async def run(args) -> int:
                                         await s.start_live(args.measure_type)
                                         live_reported = 0
                                         live_rearms_reported = s.rearms
+                                        live_keepalives_reported = s.keepalives
                                     n = s.live_stored - live_reported
                                     live_reported = s.live_stored
                                     line.append(f"live+{n}")
+                                    if s.keepalives > live_keepalives_reported:
+                                        line.append(
+                                            "keepalive+"
+                                            f"{s.keepalives - live_keepalives_reported}"
+                                        )
+                                        live_keepalives_reported = s.keepalives
                                     if s.rearms > live_rearms_reported:
                                         line.append(
                                             f"rearm+{s.rearms - live_rearms_reported}"

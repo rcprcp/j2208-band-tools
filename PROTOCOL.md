@@ -252,10 +252,15 @@ reading immediately, then zeros while it re-measures.
 
 **Session length (type 3, observed):** each `0x28` start produced ~28 s of
 ~1 Hz frames and then stopped, even with the band worn and the sensor still
-powered. Continuous collection therefore needs a reactionary re-arm after the
-stream goes quiet; every re-arm repeats the optical lock-on and its warm-up
-zeros. This is a firmware session limit, not something the collector can avoid
-by keeping the connection open.
+powered. Sending a fresh start every 20 s **while frames were still arriving**
+rolled the session over without a new optical lock-on: 70–80 s runs stayed
+continuous, with HR continuous and SpO2 continuous after its initial lock.
+Sending mode `2` ("continue") did not extend the session, and setting the
+`openPPG`/`openPPI` flags made no observable difference. One 20 s run still hit
+a 20 s gap at the first keep-alive, so the restart is not a hard guarantee and
+a reactionary re-arm is still needed as fallback. In an 80 s all-field
+keep-alive run, `bp_sys`/`bp_dia` were never populated; BP appears intermittently
+elsewhere, usually as a cached value rather than a live measurement.
 
 This is the closest thing to raw access the firmware offers: derived values,
 but live and at 2 Hz rather than the 10-minute history interval.

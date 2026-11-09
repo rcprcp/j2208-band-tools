@@ -146,8 +146,11 @@ deduplicated on insert).
 For `live`, the sensor needs **~9 s to lock on** before HR stops reading zero,
 so `--burst` below ~15 s returns nothing. `--burst 0` holds one measurement
 stream open across collection cycles instead of restarting it every interval.
-The firmware still ends each session after a short burst (~28 s observed for
-type 3), so reactionary re-arms can still incur warm-up.
+The firmware still ends a type-3 session after ~28 s, so while frames are still
+arriving the daemon sends a proactive start every 20 s to roll the session over
+without a new optical lock-on. If the stream goes silent anyway, it falls back
+to a reactionary re-arm after 5 s. HR and SpO2 are the reliable continuous
+fields; BP is often zero or a cached value rather than a live measurement.
 
 Battery percentage is recorded every cycle, so run it for a few hours and read
 the actual drain rather than guessing — printed on exit, or:
@@ -291,12 +294,14 @@ stream per BLE connection and keeps it running across collection cycles, rather
 than restarting the sensor every interval. Battery and history traffic are
 dispatched by opcode, so they no longer discard live frames.
 
-The firmware still ends each measurement session after a short burst. The
-daemon re-arms reactionarily after 5 s of actual silence, never proactively
-while data is still flowing, so each re-arm can still cost the optical lock-on
-time. That device limitation is what causes any remaining warm-up zeros. A
-proactive re-arm was considered but deliberately left out; do not add it
-without a fresh request.
+The firmware still ends each measurement session after a short burst. In
+continuous mode the daemon sends a proactive start every 20 s while frames are
+still arriving, which rolls the ~28 s type-3 session over without dropping the
+optical lock. If the stream goes quiet anyway, it falls back to a reactionary
+re-arm after 5 s. In testing, 20 s keep-alives kept HR continuous and SpO2
+continuous after its initial lock for 70–80 s; one run still missed a keep-alive,
+so the fallback matters. BP is intermittent and often a cached value in this
+mode, not a reliable continuous stream.
 
 This mode powers the optical sensor continuously and drains the band much
 faster than history collection. The defaults can be overridden with

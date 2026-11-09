@@ -163,6 +163,22 @@ class BandSessionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertTrue(store.rows)
 
+    async def test_proactive_keepalive_while_frames_flow(self):
+        with (
+            mock.patch.object(j2208_daemon, "LIVE_KEEPALIVE", 0.1),
+            mock.patch.object(j2208_daemon, "LIVE_REARM_IDLE", 5.0),
+        ):
+            session, client, _store = self._session()
+            await session.start_live(3)
+
+            for _ in range(16):
+                session._on_notify(None, bytearray(_measurement_frame()))
+                await asyncio.sleep(0.03)
+
+            self.assertEqual(session.rearms, 0)
+            self.assertGreaterEqual(session.keepalives, 1)
+            self.assertGreaterEqual(len(_start_writes(client)), 2)
+
     async def test_rearm_is_reactionary_only(self):
         with mock.patch.object(j2208_daemon, "LIVE_REARM_IDLE", 0.1):
             session, client, _store = self._session()
@@ -173,6 +189,7 @@ class BandSessionTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.03)
 
             self.assertEqual(len(_start_writes(client)), 1)
+            self.assertEqual(session.keepalives, 0)
             self.assertEqual(session.rearms, 0)
 
             for _ in range(30):
