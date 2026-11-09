@@ -65,6 +65,21 @@ from j2208_store import (  # noqa: E402
 # empty on V2 firmware (0x54 hr_dynamic, 0x60 spo2, 0x62 temp).
 POLL_TYPES = ["hr", "temp_axil", "spo2_auto", "hrv", "steps", "total", "sleep"]
 
+# Measurement fields that make a live frame worth storing. A frame may carry
+# only cached HRV/BP/stress values while the optical sensor warms up, so the
+# old hr != 0 test discarded useful rows.
+LIVE_FIELDS = ("hr", "spo2", "hrv", "stress", "bp_sys", "bp_dia", "temp_c")
+
+# The band sends a short (~10 frame) measurement burst and then goes quiet.
+# In continuous mode, re-send the start command after this many seconds
+# without a measurement notification so the stream does not die.
+LIVE_REARM_IDLE = 5.0
+
+
+def has_live_metrics(rec: dict) -> bool:
+    """True when a decoded measurement frame contains any usable field."""
+    return any(rec.get(name) for name in LIVE_FIELDS)
+
 
 class BandSession:
     """One connected session. Owns the notify subscription."""
@@ -77,6 +92,7 @@ class BandSession:
         self.write_char = None
         self.inbox: asyncio.Queue[bytes] = asyncio.Queue()
         self.measuring = False
+        self.rearms = 0
         self.interval_hint = 30.0
 
     async def setup(self):
@@ -157,22 +173,21 @@ class BandSession:
     async def live_burst(self, mtype: int, seconds: float) -> int:
         """Run the optical sensor for `seconds`, store every reading.
 
-        The sensor needs ~9s to lock on before HR stops reading 0, so a burst
-        shorter than about 15s yields nothing. seconds<=0 means leave the
-        measurement running (continuous mode) - no warm-up after the first
-        cycle, but the LEDs never switch off.
+        The band answers a start command with a short (~10 frame) burst and
+        then falls silent. In continuous mode (seconds <= 0) the measurement
+        is re-armed after LIVE_REARM_IDLE seconds without a frame, so the
+        stream keeps producing data. Each re-arm costs the same optical
+        lock-on time as a fresh start.
         """
         continuous = seconds <= 0
-        if continuous and self.measuring:
-            window = self.interval_hint
-        else:
-            self.drain_inbox()
-            await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
-            self.measuring = True
-            window = self.interval_hint if continuous else seconds
+        self.drain_inbox()
+        await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
+        self.measuring = True
+        window = self.interval_hint if continuous else seconds
 
         stored = 0
         deadline = time.monotonic() + window
+        last_frame = time.monotonic()
         try:
             while time.monotonic() < deadline:
                 if self.stop is not None and self.stop.is_set():
@@ -180,11 +195,19 @@ class BandSession:
                 try:
                     data = await asyncio.wait_for(self.inbox.get(), timeout=0.5)
                 except asyncio.TimeoutError:
+                    if (
+                        continuous
+                        and time.monotonic() - last_frame >= LIVE_REARM_IDLE
+                    ):
+                        await self.send(frame(OP_MEASUREMENT_WITH_TYPE, mtype, 1))
+                        self.rearms += 1
+                        last_frame = time.monotonic()
                     continue
                 if not data or data[0] != OP_MEASUREMENT_WITH_TYPE or len(data) < 10:
                     continue
+                last_frame = time.monotonic()
                 rec = decode(data)
-                if rec.get("hr"):  # skip the warm-up zeros
+                if has_live_metrics(rec):
                     stored += await self.store.live(rec)
         finally:
             if not continuous:
@@ -251,8 +274,11 @@ async def run(args) -> int:
                             line.append(f"batt={pct}%")
 
                         if args.mode == "live":
+                            before_rearms = s.rearms
                             n = await s.live_burst(args.measure_type, args.burst)
                             line.append(f"live+{n}")
+                            if s.rearms > before_rearms:
+                                line.append(f"rearm+{s.rearms - before_rearms}")
 
                         # History sync is cheap but slow; do it every Nth cycle.
                         if cycle == 1 or cycle % args.history_every == 0:

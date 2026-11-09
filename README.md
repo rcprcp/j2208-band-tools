@@ -282,8 +282,15 @@ reports HR), and `--burst 0` (sensor stays on). Stop it with `Ctrl-C`; it uses
 connection.
 
 Live readings land in `live`; history syncs continue on the daemon's normal
-schedule. This mode powers the optical sensor continuously and drains the band
-much faster than history collection. The defaults can be overridden with
+schedule. A frame is stored whenever any decoded metric (HR, SpO2, HRV, stress,
+BP or temperature) is non-zero, so cached BP/HRV frames are not discarded while
+HR is still zero. In continuous mode the daemon re-sends the measurement start
+after 5 s without data, because the band answers each start with only a short
+burst. Expect roughly 9 s of optical lock-on per re-arm, then another burst of
+readings.
+
+This mode powers the optical sensor continuously and drains the band much
+faster than history collection. The defaults can be overridden with
 `J2208_LIVE_MEASURE_TYPE`, `J2208_LIVE_BURST`, `J2208_LIVE_LOG`, and
 `J2208_LIVE_LOCK`.
 
