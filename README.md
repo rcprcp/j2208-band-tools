@@ -228,12 +228,49 @@ pg_dump -d bob -n j2208 > j2208.sql
 python tools/j2208_pg_setup.py --drop --yes
 ```
 
+## Cron collection
+
+The wrapper `tools/j2208_collect_once.sh` runs one `--once` history sweep,
+serialises overlapping invocations with `flock`, and appends to a log.
+
+Create the environment file once (do not put credentials in the crontab):
+
+```bash
+mkdir -p ~/.config/j2208
+cp .env.example ~/.config/j2208/env
+chmod 600 ~/.config/j2208/env
+$EDITOR ~/.config/j2208/env   # set J2208_BAND_ADDRESS and J2208_PG_*
+```
+
+Run it manually:
+
+```bash
+tools/j2208_collect_once.sh
+```
+
+Crontab entry, every 30 minutes:
+
+```cron
+*/30 * * * * /home/bob/j2208-band-tools/tools/j2208_collect_once.sh
+```
+
+The full seven-type sweep takes about 60–90 seconds and the band retains only
+~4–5 days, so 30 minutes is comfortably frequent. The wrapper reads
+`J2208_ENV_FILE` if set, otherwise `~/.config/j2208/env`, then `<repo>/.env`.
+Defaults can be overridden with `J2208_COLLECT_TYPES`, `J2208_COLLECT_LOG`,
+`J2208_COLLECT_LOCK`, and `J2208_COLLECT_TIMEOUT`.
+
+Normal output goes to `~/.local/state/j2208/collect.log`; cron only receives
+stderr if a run fails. Set `MAILTO=""` in the crontab if you do not want
+failure mail.
+
 ## Repo layout
 
 | Path | What |
 | --- | --- |
 | `tools/j2208.py` | BLE client — scan / probe / info / live / history / ppg / send |
 | `tools/j2208_daemon.py` | Long-running collector, SQLite or PostgreSQL output |
+| `tools/j2208_collect_once.sh` | Cron-safe one-shot collector with `flock` and logging |
 | `tools/j2208_store.py` | Storage backends, env parsing, identifier validation |
 | `tools/j2208_pg_setup.py` | Create / verify / drop the PostgreSQL schema |
 | `tools/j2208_migrate_sqlite.py` | Copy an existing SQLite capture into PostgreSQL |
