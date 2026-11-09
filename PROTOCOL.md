@@ -250,6 +250,13 @@ roughly twice a second (illustrative: 78, 77, 76, 74, 74, 73 bpm). Types 3 and
 temperature together, all populated. Type 1 (HRV) returns the last cached
 reading immediately, then zeros while it re-measures.
 
+**Session length (type 3, observed):** each `0x28` start produced ~28 s of
+~1 Hz frames and then stopped, even with the band worn and the sensor still
+powered. Continuous collection therefore needs a reactionary re-arm after the
+stream goes quiet; every re-arm repeats the optical lock-on and its warm-up
+zeros. This is a firmware session limit, not something the collector can avoid
+by keeping the connection open.
+
 This is the closest thing to raw access the firmware offers: derived values,
 but live and at 2 Hz rather than the 10-minute history interval.
 

@@ -144,8 +144,10 @@ faster than the firmware records just re-reads the same rows (they are
 deduplicated on insert).
 
 For `live`, the sensor needs **~9 s to lock on** before HR stops reading zero,
-so `--burst` below ~15 s returns nothing. `--burst 0` leaves the sensor on
-permanently (no repeated warm-up, maximum drain).
+so `--burst` below ~15 s returns nothing. `--burst 0` holds one measurement
+stream open across collection cycles instead of restarting it every interval.
+The firmware still ends each session after a short burst (~28 s observed for
+type 3), so reactionary re-arms can still incur warm-up.
 
 Battery percentage is recorded every cycle, so run it for a few hours and read
 the actual drain rather than guessing — printed on exit, or:
@@ -284,10 +286,17 @@ connection.
 Live readings land in `live`; history syncs continue on the daemon's normal
 schedule. A frame is stored whenever any decoded metric (HR, SpO2, HRV, stress,
 BP or temperature) is non-zero, so cached BP/HRV frames are not discarded while
-HR is still zero. In continuous mode the daemon re-sends the measurement start
-after 5 s without data, because the band answers each start with only a short
-burst. Expect roughly 9 s of optical lock-on per re-arm, then another burst of
-readings.
+HR is still zero. With `--burst 0`, the daemon starts a single measurement
+stream per BLE connection and keeps it running across collection cycles, rather
+than restarting the sensor every interval. Battery and history traffic are
+dispatched by opcode, so they no longer discard live frames.
+
+The firmware still ends each measurement session after a short burst. The
+daemon re-arms reactionarily after 5 s of actual silence, never proactively
+while data is still flowing, so each re-arm can still cost the optical lock-on
+time. That device limitation is what causes any remaining warm-up zeros. A
+proactive re-arm was considered but deliberately left out; do not add it
+without a fresh request.
 
 This mode powers the optical sensor continuously and drains the band much
 faster than history collection. The defaults can be overridden with
